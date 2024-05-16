@@ -67,7 +67,10 @@ def _validation_worker_init_fn(worker_id):
         for lightning because otherwise it will display a message
         at info level about the seed being changed. """
     from lightning.pytorch import seed_everything
+    level = logging.getLogger("lightning_fabric.utilities.seed").level
+    logging.getLogger("lightning_fabric.utilities.seed").setLevel(logging.WARN)
     seed_everything(42)
+    logging.getLogger("lightning_fabric.utilities.seed").setLevel(level)
 
 
 class KrakenTrainer(L.Trainer):
@@ -210,6 +213,7 @@ class RecognitionModel(L.LightningModule):
                  binary_dataset_split: bool = False,
                  num_workers: int = 1,
                  load_hyper_parameters: bool = False,
+                 repolygonize: bool = False,
                  force_binarization: bool = False,
                  format_type: Literal['path', 'alto', 'page', 'xml', 'binary'] = 'path',
                  codec: Optional[Dict] = None,
@@ -251,7 +255,13 @@ class RecognitionModel(L.LightningModule):
         if hyper_params:
             hyper_params_.update(hyper_params)
         self.hyper_params = hyper_params_
-        self.save_hyperparameters()
+        print("="*100)
+        print(self.hyper_params)
+        print("="*100)
+
+        #self.save_hyperparameters()
+        self.save_hyperparameters("hyper_params")
+        #self.save_hyperparameters(hyper_params_)
 
         self.reorder = reorder
         self.append = append
@@ -287,6 +297,8 @@ class RecognitionModel(L.LightningModule):
             valid_norm = False
         elif format_type == 'binary':
             DatasetClass = ArrowIPCRecognitionDataset
+            if repolygonize:
+                logger.warning('Repolygonization enabled in `binary` mode. Will be ignored.')
             valid_norm = False
             logger.info(f'Got {len(training_data)} binary dataset files for training data')
             training_data = [{'file': file} for file in training_data]
@@ -297,6 +309,8 @@ class RecognitionModel(L.LightningModule):
             if force_binarization:
                 logger.warning('Forced binarization enabled in `path` mode. Will be ignored.')
                 force_binarization = False
+            if repolygonize:
+                logger.warning('Repolygonization enabled in `path` mode. Will be ignored.')
             if binary_dataset_split:
                 logger.warning('Internal binary dataset splits are enabled but using non-binary dataset files. Will be ignored.')
                 binary_dataset_split = False
@@ -315,6 +329,8 @@ class RecognitionModel(L.LightningModule):
                 if force_binarization:
                     logger.warning('Forced binarization enabled with box lines. Will be ignored.')
                     force_binarization = False
+                if repolygonize:
+                    logger.warning('Repolygonization enabled with box lines. Will be ignored.')
                 if binary_dataset_split:
                     logger.warning('Internal binary dataset splits are enabled but using non-binary dataset files. Will be ignored.')
                     binary_dataset_split = False
@@ -502,32 +518,38 @@ class RecognitionModel(L.LightningModule):
         self.val_cer.update(pred, decoded_targets)
         self.val_wer.update(pred, decoded_targets)
 
+        # print(f"PARAMS:\n{self.hparams.hyper_params}")
+        # print("+"*100)
+        # print()
+        # print(type(self.hparams))
+        # print()
+        # print(type(self.hparams.hyper_params))
+        # print("+"*100)
+        # print()
         if self.logger and self.trainer.state.stage != 'sanity_check' and self.hparams.hyper_params["batch_size"] * batch_idx < 16:
             for i in range(self.hparams.hyper_params["batch_size"]):
                 count = self.hparams.hyper_params["batch_size"] * batch_idx + i
-                if count < 16:
-                    self.logger.experiment.add_image(f'Validation #{count}, target: {decoded_targets[i]}',
-                                                     batch['image'][i],
-                                                     self.global_step,
-                                                     dataformats="CHW")
-                    self.logger.experiment.add_text(f'Validation #{count}, target: {decoded_targets[i]}',
-                                                    pred[i],
-                                                    self.global_step)
+                # if count < 16:
+                #    self.logger.experiment.add_image(f'Validation #{count}, target: {decoded_targets[i]}',
+                #                                     batch['image'][i],
+                #                                     self.global_step,
+                #                                     dataformats="CHW")
+                #    self.logger.experiment.add_text(f'Validation #{count}, target: {decoded_targets[i]}',
+                #                                    pred[i],
+                #                                    self.global_step)
 
     def on_validation_epoch_end(self):
-        if not self.trainer.sanity_checking:
-            accuracy = 1.0 - self.val_cer.compute()
-            word_accuracy = 1.0 - self.val_wer.compute()
+        accuracy = 1.0 - self.val_cer.compute()
+        word_accuracy = 1.0 - self.val_wer.compute()
 
-            if accuracy > self.best_metric:
-                logger.debug(f'Updating best metric from {self.best_metric} ({self.best_epoch}) to {accuracy} ({self.current_epoch})')
-                self.best_epoch = self.current_epoch
-                self.best_metric = accuracy
-            logger.info(f'validation run: total chars {self.val_cer.total} errors {self.val_cer.errors} accuracy {accuracy}')
-            self.log('val_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('val_word_accuracy', word_accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('val_metric', accuracy, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        # reset metrics even if not sanity checking
+        if accuracy > self.best_metric:
+            logger.debug(f'Updating best metric from {self.best_metric} ({self.best_epoch}) to {accuracy} ({self.current_epoch})')
+            self.best_epoch = self.current_epoch
+            self.best_metric = accuracy
+        logger.info(f'validation run: total chars {self.val_cer.total} errors {self.val_cer.errors} accuracy {accuracy}')
+        self.log('val_accuracy', accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_word_accuracy', word_accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_metric', accuracy, on_step=False, on_epoch=True, prog_bar=False, logger=True)
         self.val_cer.reset()
         self.val_wer.reset()
 
@@ -542,7 +564,7 @@ class RecognitionModel(L.LightningModule):
                 for i in range(min(len(self.train_set), 16)):
                     idx = np.random.randint(len(self.train_set))
                     sample = self.train_set[idx]
-                    self.logger.experiment.add_image(f'train_set sample #{i}: {sample["target"]}', sample['image'])
+                    #self.logger.experiment.add_image(f'train_set sample #{i}: {sample["target"]}', sample['image'])
 
             if self.append:
                 self.train_set.dataset.encode(self.codec)
@@ -707,12 +729,12 @@ class SegmentationModel(L.LightningModule):
                  output: str = 'model',
                  spec: str = default_specs.SEGMENTATION_SPEC,
                  model: Optional[Union['PathLike', str]] = None,
-                 training_data: Union[Sequence[Union['PathLike', str]], Sequence[Segmentation]] = None,
-                 evaluation_data: Optional[Union[Sequence[Union['PathLike', str]], Sequence[Segmentation]]] = None,
+                 training_data: Union[Sequence[Union['PathLike', str]], Sequence[Dict[str, Any]]] = None,
+                 evaluation_data: Optional[Union[Sequence[Union['PathLike', str]], Sequence[Dict[str, Any]]]] = None,
                  partition: Optional[float] = 0.9,
                  num_workers: int = 1,
                  force_binarization: bool = False,
-                 format_type: Literal['path', 'alto', 'page', 'xml', None] = 'path',
+                 format_type: Literal['path', 'alto', 'page', 'xml'] = 'path',
                  suppress_regions: bool = False,
                  suppress_baselines: bool = False,
                  valid_regions: Optional[Sequence[str]] = None,
@@ -907,26 +929,25 @@ class SegmentationModel(L.LightningModule):
         self.val_freq_iu.update(pred, y)
 
     def on_validation_epoch_end(self):
-        if not self.trainer.sanity_checking:
-            pixel_accuracy = self.val_px_accuracy.compute()
-            mean_accuracy = self.val_mean_accuracy.compute()
-            mean_iu = self.val_mean_iu.compute()
-            freq_iu = self.val_freq_iu.compute()
 
-            if mean_iu > self.best_metric:
-                logger.debug(f'Updating best metric from {self.best_metric} ({self.best_epoch}) to {mean_iu} ({self.current_epoch})')
-                self.best_epoch = self.current_epoch
-                self.best_metric = mean_iu
+        pixel_accuracy = self.val_px_accuracy.compute()
+        mean_accuracy = self.val_mean_accuracy.compute()
+        mean_iu = self.val_mean_iu.compute()
+        freq_iu = self.val_freq_iu.compute()
 
-            logger.info(f'validation run: accuracy {pixel_accuracy} mean_acc {mean_accuracy} mean_iu {mean_iu} freq_iu {freq_iu}')
+        if mean_iu > self.best_metric:
+            logger.debug(f'Updating best metric from {self.best_metric} ({self.best_epoch}) to {mean_iu} ({self.current_epoch})')
+            self.best_epoch = self.current_epoch
+            self.best_metric = mean_iu
 
-            self.log('val_accuracy', pixel_accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('val_mean_acc', mean_accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('val_mean_iu', mean_iu, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('val_freq_iu', freq_iu, on_step=False, on_epoch=True, prog_bar=True, logger=True)
-            self.log('val_metric', mean_iu, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        logger.info(f'validation run: accuracy {pixel_accuracy} mean_acc {mean_accuracy} mean_iu {mean_iu} freq_iu {freq_iu}')
 
-        # reset metrics even if sanity checking
+        self.log('val_accuracy', pixel_accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_mean_acc', mean_accuracy, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_mean_iu', mean_iu, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_freq_iu', freq_iu, on_step=False, on_epoch=True, prog_bar=True, logger=True)
+        self.log('val_metric', mean_iu, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+
         self.val_px_accuracy.reset()
         self.val_mean_accuracy.reset()
         self.val_mean_iu.reset()
@@ -1019,7 +1040,7 @@ class SegmentationModel(L.LightningModule):
                 self.val_set.dataset.class_mapping = self.nn.user_metadata['class_mapping']
 
             # updates model's hyper params with user-defined ones
-            self.nn.hyper_params = self.hparams.hyper_params
+            self.nn.hyper_params = self.hparams
 
             # change topline/baseline switch
             loc = {None: 'centerline',
