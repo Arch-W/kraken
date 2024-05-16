@@ -23,7 +23,7 @@ import tempfile
 from collections import Counter
 from functools import partial
 from multiprocessing import Pool
-from typing import TYPE_CHECKING, Literal, Callable, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pyarrow as pa
@@ -36,6 +36,9 @@ from kraken.lib.segmentation import extract_polygons
 from kraken.lib.util import is_bitonal, make_printable
 from kraken.lib.xml import XMLPage
 
+# ADDED
+import os
+
 if TYPE_CHECKING:
     from os import PathLike
 
@@ -46,13 +49,23 @@ logger = logging.getLogger(__name__)
 
 def _extract_line(xml_record, skip_empty_lines: bool = True, legacy_polygons: bool = False):
     lines = []
+
+    #ADDED
+    #file_name = xml_record.filename
+
     try:
         im = Image.open(xml_record.imagename)
+
+        #ADDED
+        file_name = im.filename
+        #print(f"IMAGE FILE NAME {file_name}")
+
     except (FileNotFoundError, UnidentifiedImageError):
         return lines, None, None
     if is_bitonal(im):
         im = im.convert('1')
-    for idx, rec in enumerate(xml_record.lines):
+    recs = xml_record.lines.values()
+    for idx, rec in enumerate(recs):
         seg = Segmentation(text_direction='horizontal-lr',
                            imagename=xml_record.imagename,
                            type=xml_record.type,
@@ -63,17 +76,17 @@ def _extract_line(xml_record, skip_empty_lines: bool = True, legacy_polygons: bo
         try:
             line_im, line = next(extract_polygons(im, seg, legacy=legacy_polygons))
         except KrakenInputException:
-            logger.warning(f'Invalid line {idx} in {xml_record.imagename}')
+            logger.warning(f'Invalid line {idx} in {im.filename}')
             continue
         except Exception as e:
-            logger.warning(f'Unexpected exception {e} from line {idx} in {xml_record.imagename}')
+            logger.warning(f'Unexpected exception {e} from line {idx} in {im.filename}')
             continue
         if not line.text and skip_empty_lines:
             continue
         fp = io.BytesIO()
         line_im.save(fp, format='png')
         lines.append({'text': line.text, 'im': fp.getvalue()})
-    return lines, im.mode
+    return lines, im.mode, file_name 
 
 
 def _extract_path_line(xml_record, skip_empty_lines: bool = True):
@@ -103,9 +116,9 @@ def parse_path(path: Union[str, 'PathLike'],
     return {'image': path, 'lines': [{'text': gt}]}
 
 
-def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentation']]] = None,
+def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', Dict]]] = None,
                          output_file: Union[str, 'PathLike'] = None,
-                         format_type: Literal['xml', 'alto', 'page', None] = 'xml',
+                         format_type: str = 'xml',
                          num_workers: int = 0,
                          ignore_splits: bool = False,
                          random_split: Optional[Tuple[float, float, float]] = None,
@@ -119,11 +132,12 @@ def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentati
     binary dataset.
 
     Args:
-        files: List of XML input files or Segmentation container objects.
+        files: List of XML input files.
         output_file: Path to the output file.
         format_type: One of `xml`, `alto`, `page`, `path`, or None. In `None`
                      mode, the files argument is expected to be a list of
-                     `kraken.containers.Segmentation` objects.
+                     dictionaries in the output format of the
+                     `kraken.lib.xml.parse_{alto,page,xml}` functions.
         num_workers: Number of workers for parallelized extraction of line
                      images. Set to `0` to disable parallelism.
         ignore_splits: Switch to disable serialization of the explicit
@@ -166,8 +180,6 @@ def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentati
         for doc in files:
             try:
                 data = parse_fn(doc)
-                if format_type in ['xml', 'alto', 'page']:
-                    data = data.to_container()
             except (FileNotFoundError, KrakenInputException, ValueError):
                 logger.warning(f'Invalid input file {doc}')
                 continue
@@ -191,13 +203,13 @@ def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentati
     alphabet = Counter()
     num_lines = 0
     for doc in docs:
-        if format_type in ['xml', 'alto', 'page', None]:
-            lines = doc.lines
-        elif format_type == 'path':
+        if format_type in ['xml', 'alto', 'page']:
+            lines = doc.lines.values()
+        else:
             lines = doc['lines']
         for line in lines:
             num_lines += 1
-            alphabet.update(line.text if format_type in ['xml', 'alto', 'page', None] else line['text'])
+            alphabet.update(line.text if format_type in ['xml', 'alto', 'page'] else line['text'])
 
     callback(0, num_lines)
 
@@ -229,9 +241,10 @@ def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentati
                 }
 
     ty = pa.struct([('text', pa.string()), ('im', pa.binary())])
-    schema = pa.schema([('lines', ty), ('train', pa.bool_()), ('validation', pa.bool_()), ('test', pa.bool_())])
+    # ADDED
+    schema = pa.schema([('lines', ty), ('train', pa.bool_()), ('validation', pa.bool_()), ('test', pa.bool_()), ('file', pa.string())])
 
-    def _make_record_batch(line_cache):
+    def _make_record_batch(line_cache, filename):
         ar = pa.array(line_cache, type=ty)
         if random_split:
             indices = np.random.choice(4, len(line_cache), p=(0.0,) + random_split)
@@ -247,9 +260,18 @@ def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentati
         train_mask = pa.array(tr_ind)
         val_mask = pa.array(val_ind)
         test_mask = pa.array(test_ind)
-        rbatch = pa.RecordBatch.from_arrays([ar, train_mask, val_mask, test_mask], schema=schema)
+        
+        # ADDED
+        # Create the array filled with the string value
+        array_filename = np.full(len(line_cache), filename, dtype=object)
+        filename_mask = pa.array(array_filename)
+
+        # Added
+        rbatch = pa.RecordBatch.from_arrays([ar, train_mask, val_mask, test_mask, filename_mask], schema=schema)
         return rbatch, (len(line_cache), int(sum(indices == 1)), int(sum(indices == 2)), int(sum(indices == 3)))
 
+    print(f"\n\nDOCS:\n{docs[0].filename}\n")
+    print(f"LENGTH : {len(docs)}")
     line_cache = []
     logger.info('Writing lines to temporary file.')
     with tempfile.TemporaryDirectory() as tmp_output_dir:
@@ -278,16 +300,30 @@ def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentati
                                 callback(len(line_cache), num_lines)
                                 line_cache = []
                 else:
-                    for page_lines, im_mode in map(extract_fn, docs):
+                    # ADDED
+                    for page_lines, im_mode, filename in map(extract_fn, docs):
+                        # ADDED"
+                        directories, file = os.path.split(filename)
+                        # Get the last directory in the path
+                        last_directory = os.path.basename(directories)
+                        # Construct the desired output
+                        filename = os.path.join(last_directory, file)
+                        print("Middle directory:", filename)
+                        
                         if page_lines:
                             line_cache.extend(page_lines)
                             # comparison RGB(A) > L > 1
                             if im_mode > metadata['lines']['im_mode']:
                                 metadata['lines']['im_mode'] = im_mode
 
+                        # ADDED
+                        recordbatch_size = 1
+
                         if len(line_cache) >= recordbatch_size:
                             logger.info(f'Flushing {len(line_cache)} lines into {tmp_file}.')
-                            rbatch, counts = _make_record_batch(line_cache)
+
+                            # ADDED
+                            rbatch, counts = _make_record_batch(line_cache, str(filename))
                             metadata['lines']['counts'].update({'all': counts[0],
                                                                 'train': counts[1],
                                                                 'validation': counts[2],
@@ -296,9 +332,18 @@ def build_binary_dataset(files: Optional[List[Union[str, 'PathLike', 'Segmentati
                             callback(len(line_cache), num_lines)
                             line_cache = []
 
+                            # ADDED
+                            filename = ""
+
                 if line_cache:
+                    #ADDED
+                    print(f"\n\n LAST LINE CACHE {len(line_cache)}\n\n")
+
                     logger.info(f'Flushing last {len(line_cache)} lines into {tmp_file}.')
-                    rbatch, counts = _make_record_batch(line_cache)
+                    
+                    #ADDED
+                    rbatch, counts = _make_record_batch(line_cache, filename)
+
                     metadata['lines']['counts'].update({'all': counts[0],
                                                         'train': counts[1],
                                                         'validation': counts[2],
